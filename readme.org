@@ -1,6 +1,6 @@
 #+TITLE: Interpreting Brainfuck with Common Lisp
 #+AUTHOR: Nathan Shostek
-#+OPTIONS toc:t
+#+OPTIONS: toc:t
 
 This repo contains an implementation of brainfuck. This readme is a walkthrough/guide to how this was implemented. If you just want the code, please see =brainfuck.lisp=. 
 
