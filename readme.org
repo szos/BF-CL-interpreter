@@ -1,0 +1,468 @@
+#+TITLE: Interpreting Brainfuck with Common Lisp
+#+AUTHOR: Nathan Shostek
+#+OPTIONS toc:
+
+This repo contains an implementation of brainfuck. This readme is a walkthrough/guide to how this was implemented. If you just want the code, please see =brainfuck.lisp=. 
+
+* Getting Started
+  Brainfuck has eight operations which are used to manipulate a tape. The canonical implementation of the tape is an array of 30000 unsigned bytes of 8 bits. There is an offset (initially zero) that indicates our position along the tape. 
+  | operation | meaning                                                                   |
+  | >         | Increment the offset                                                      |
+  | <         | Decrement the offset                                                      |
+  | +         | Increment the value at the offset                                         |
+  | -         | Decrement the value at the offset                                         |
+  | .         | Write the value of the cell at the offset                                 |
+  | ,         | Read a value into the cell at the offset                                  |
+  | [         | When the value of the cell at the offset is 0, jump past the matching ]   |
+  | ]         | When the value of the cell at the offset is not 0, jump to the matching [ |
+
+** Implementation Considerations
+   Given the spartan nature of brainfucks spec, there are several well defined areas of doubt and uncertainty within which implementations differ. 
+
+*** Memory, Cells, and Wrapping
+    The size of the array, and the size of the cells in the array, vary from implementation to implementation. Our implementation will have an array of 30.000 cells, with each cell being an unsigned 8 bit byte. We should also avoid being a fascist, score-computing interpreter and allow over- and underflow of our cells. That is to say, we will allow cells to wrap their values. 
+
+*** EOF
+    EOF is unspecified in brainfuck. Given our usage of Common Lisp this wont be a terrible problem, as we will see in our implementation of the comma operator (=,=). 
+
+* Basic Implementation
+   We can start by defining a function to interpret a string as brainfuck and setting up our initial state.
+   #+Begin_src lisp
+     (defun interpret-bf (string)
+       (let ((array (make-array 30000 :element-type '(unsigned-byte 8)
+				      :initial-element 0))
+	     (offset 0))))
+   #+end_src
+** Looping Through our Input String
+    We want to loop through our input string, parsing and interpreting it. Since strings are just arrays, we can use the same functions and methods for our brainfuck tape and our string.
+    #+begin_src lisp
+      (defun interpret-bf (string)
+	(let ((array (make-array 30000 :element-type '(unsigned-byte 8)
+				       :initial-element 0))
+	      (offset 0)
+	      (string-position 0)
+	      (max-position (- (length string) 1)))
+	  (flet ((next-char ()
+		   (let ((x (+ (string-position 1))))
+		     (if (> x max-position)
+			 (return-from interpret-bf (values 'finished))
+			 (setf string-position x))))
+		 (prev-char ()
+		   (let ((x (- string-position 1)))
+		     (if (< x 0)
+			 (return-from interpret-bf (values 'source-error))
+			 (setf string-position x))))))))
+    #+end_src
+    Now that we have a way of walking through the string we sent in, we can walk the string and interpret it. 
+** Parsing the Input String
+    For parsing the input string, we basically want a dispatch table for each operation. Given the simplicity of brainfuck, and the fact that none of the operations need to be functions with arguments, I have chosen to implement this using tagbody/go. It could be implemented using recursion, or variations of ~do~ as well. 
+*** The Dispatch Table
+     We first check the character we're interpreting, and then go to its instruction. 
+     #+begin_src lisp
+       (case (aref string string-position)
+	 (#\>  (go bf->))
+	 (#\<  (go bf-<))
+	 (#\+  (go bf-+))
+	 (#\-  (go bf--))
+	 (#\.  (go bf-dot))
+	 (#\,  (go bf-comma))
+	 (#\[  (go bf-[))
+	 (#\]  (go bf-]))
+	 (otherwise (go bf-process)))
+     #+end_src
+*** Moving Through the String
+     To move through the string, we will need to call our next/prev char functions. Given that our string-position counter starts at zero, we want to increment our position at the end of every cycle, or rather, just before our dispatch statement. We can do this within our tagbody/go.
+     #+Begin_src lisp
+       (defun interpret-bf (string)
+	 (let ((array (make-array 30000 :element-type '(unsigned-byte 8)
+					:initial-element 0))
+	       (offset 0)
+	       (string-position 0)
+	       (max-position (- (length string) 1)))
+	   (flet ((next-char ()
+		    (let ((x (+ string-position 1)))
+		      (if (> x max-position)
+			  (return-from interpret-bf (values 'finished))
+			  (setf string-position x))))
+		  (prev-char ()
+		    (let ((x (- string-position 1)))
+		      (if (< x 0)
+			  (return-from interpret-bf (values 'source-error))
+			  (setf string-position x)))))
+	     (tagbody
+		(go bf-dispatch)
+	      bf-process
+		(next-char)
+	      bf-dispatch
+		(case (aref string string-position)
+		  (#\>  (go bf->))
+		  (#\<  (go bf-<))
+		  (#\+  (go bf-+))
+		  (#\-  (go bf--))
+		  (#\.  (go bf-dot))
+		  (#\,  (go bf-comma))
+		  (#\[  (go bf-[))
+		  (#\]  (go bf-]))
+		  (otherwise (go bf-process)))))))
+     #+end_src
+** Implementing the Brainfuck Operations
+    Now we need to actually implement the base operations of brainfuck. We can do this with tags and go statements which direct to the bf-process tag. 
+*** Increment and Decrement the Offset (< and > )
+     These operations are the simplest to implement. 
+     #+Begin_src lisp
+       (tagbody
+	bf->
+	  (incf offset)
+	  (go bf-process)
+	bf-<
+	  (decf offset)
+	  (go bf-process))
+     #+end_src
+*** Increment and Decrement Cells (+ and -)
+     These operations are a little more complex if we want to force under- and overflow (which we do so as to not be fascist). This can be done with two more flet bindings, which check the value before setting and enforce overflow
+     #+Begin_src lisp
+       (flet ((incf-at-offset ()
+		(let ((x (aref array offset)))
+		  (setf (aref array offset) (or (and (= x 255) 0) (+ x 1)))))
+	      (decf-at-offset ()
+		(let ((x (aref array offset)))
+		  (setf (aref array offset) (or (and (= x 0) 255) (- x 1))))))
+	 (tagbody
+	  bf-+
+	    (incf-at-offset)
+	    (go bf-process)
+	  bf--
+	    (decf-at-offset)
+	    (go bf-process)))
+     #+end_src
+*** Input and Output (. and ,)
+     Output is very simple to implement using ~code-char~, while input requires some extra finaegeling. 
+**** Output (.)
+      We can just format the character to ~*standard-output*~.
+      #+begin_src lisp
+	(tagbody
+	 bf-dot
+	   (format *standard-output* "~C" (code-char (aref array offset)))
+	   (go bf-process))
+      #+end_src
+**** Input (,)
+      Input poses some unique difficulties. Firstly, ~*standard-input*~ is a general input stream (at least on my system), and as such doesnt have a method defined for ~read-byte~. Ideally we would be able to just read in one ~'(unsigned-byte 8)~ at a time, but the best we can do is ~read-char~ and validate the input. We do this validation by checking that the ~char-code~ of the character read in is between 0 and 255. We also need to check for EOF. We will be using 0 as the EOF value.
+      #+begin_src lisp
+	(tagbody
+	 bf-comma
+	   (let ((ch (or (read-char *standard-input* nil) (code-char 0))))
+	     (unless (typep (char-code ch) '(integer 0 255))
+	       (error "Invalid Character ~A Entered" ch))
+	     (setf (aref array offset) (char-code ch))) 
+	   (go bf-process))
+      #+end_src
+*** Looping ([ and ])
+     Finally we have our looping operators. These are handled by using next/prev-char to move through the input string. This is pretty simple stuff, just checking for matching brackets. We loop through in a ~do~ loop, checking and incrementing a match variable to track our bracket depth.
+     #+begin_src lisp
+       (tagbody
+	bf-[
+	  (when (= 0 (aref array offset))
+	    (let ((matches 0))
+	      (do ((ch (aref string string-position)
+		       (aref string string-position)))
+		  ((and (or (and (char= ch #\[)
+				 (incf matches))
+			    t)
+			(and (char= ch #\])
+			     (decf matches))
+			(= 0 matches)))
+		(next-char))))
+	  (go bf-process)
+	bf-]
+	  (unless (= 0 (aref array offset))
+	    (let ((matches 0))
+	      (do ((ch (aref string string-position)
+		       (aref string string-position)))
+		  ((and (or (and (char= ch #\])
+				 (incf matches))
+			    t)
+			(and (char= ch #\[)
+			     (decf matches))
+			(= 0 matches)))
+		(prev-char))))
+	  (go bf-process))
+     #+end_src
+
+** Putting it all together
+    Now that we have our subroutines defined, lets put everything together into one function. We can just copy/paste our tags into the same ~tagbody~. Since we are using ~tagbody~ we can remove the ~(go bf-process)~ statement from the final subroutine (bf-]).
+    #+begin_src lisp
+      (defun interpret-bf (string)
+	(let ((array (make-array 30000 :element-type '(unsigned-byte 8)
+				       :initial-element 0))
+	      (offset 0)
+	      (string-position 0)
+	      (max-position (- (length string) 1)))
+	  (flet ((next-char ()
+		   (let ((x (+ (string-position 1))))
+		     (if (> x max-position)
+			 (return-from interpret-bf (values 'finished))
+			 (setf string-position x))))
+		 (prev-char ()
+		   (let ((x (- string-position 1)))
+		     (if (< x 0)
+			 (return-from interpret-bf (values 'source-error))
+			 (setf string-position x))))
+		 (incf-at-offset ()
+		   (let ((x (aref array offset)))
+		     (setf (aref array offset) (or (and (= x 255) 0) (+ x 1)))))
+		 (decf-at-offset ()
+		   (let ((x (aref array offset)))
+		     (setf (aref array offset) (or (and (= x 0) 255) (- x 1))))))
+	    (tagbody
+	       (go bf-dispatch)
+	     bf->
+	       (incf offset)
+	       (go bf-process)
+	     bf-<
+	       (decf offset)
+	       (go bf-process)
+	     bf-+
+	       (incf-at-offset)
+	       (go bf-process)
+	     bf--
+	       (decf-at-offset)
+	       (go bf-process)
+	     bf-dot
+	       (format *standard-output* "~C" (code-char (aref array offset)))
+	       (go bf-process)
+	     bf-comma
+	       (let ((ch (or (read-char *standard-input* nil) (code-char 0))))
+		 (unless (typep (char-code ch) '(integer 0 255))
+		   (error "Invalid Character ~A Entered" ch))
+		 (setf (aref array offset) (char-code ch))) 
+	       (go bf-process)
+	     bf-[
+	       (when (= 0 (aref array offset))
+		 (let ((matches 0))
+		   (do ((ch (aref string string-position)
+			    (aref string string-position)))
+		       ((and (or (and (char= ch #\[)
+				      (incf matches))
+				 t)
+			     (and (char= ch #\])
+				  (decf matches))
+			     (= 0 matches)))
+		     (incf-string-pos))))
+	       (go bf-process)
+	     bf-]
+	       (unless (= 0 (aref array offset))
+		 (let ((matches 0))
+		   (do ((ch (aref string string-position)
+			    (aref string string-position)))
+		       ((and (or (and (char= ch #\])
+				      (incf matches))
+				 t)
+			     (and (char= ch #\[)
+				  (decf matches))
+			     (= 0 matches)))
+		     (decf-string-pos))))
+	       (go bf-process)
+	     bf-process
+	       (next-char)
+	     bf-dispatch
+	       (case (aref string string-position)
+		 (#\>  (go bf->))
+		 (#\<  (go bf-<))
+		 (#\+  (go bf-+))
+		 (#\-  (go bf--))
+		 (#\.  (go bf-dot))
+		 (#\,  (go bf-comma))
+		 (#\[  (go bf-[))
+		 (#\]  (go bf-]))
+		 (otherwise (go bf-process)))))))
+    #+end_src
+** Hello, World!
+    Now its time to test our interpreter. We will use the basic hello world program:
+    #+begin_src lisp
+      (interpret-bf "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.")
+    #+end_src
+    If all goes according to plan, we should see ~Hello World!~ printed to standard output, and return ~FINISHED~. Now, since we implemented under- and overflow, we can test a more complex hello world program:
+    #+begin_src lisp
+      (interpret-bf ">++++++++[-<+++++++++>]<.>>+>-[+]++>++>+++[>[->+++<<+++>]<<]>-----.>->
+      +++..+++.>-.<<+[>[+>+]>>]<--------------.>>.+++.------.--------.>+.>+.")
+    #+end_src
+
+* Extending the Implementation
+   Our implementation is great and all, but its rather barebones and could use some more features. For example, there are some programs that require cells to the left of the offset, which would signal an error in our implementation. A simple workaround would be to allow the user to provide an initial offset. 
+   
+   Lets allow user-provided alternatives to all of our state variables:
+   #+begin_SRC lisp
+     (defun interpret-bf (string &key initial-offset initial-array)
+       (let ((array (or initial-array
+			(make-array 30000 :element-type '(unsigned-byte 8)
+					  :initial-element 0)))
+	     (offset (or initial-offset 0)))))
+   #+end_src
+** Returning State
+    Another useful extension would be to return the array and the offset. This would allow us to write a brainfuck REPL using our interpretation function. Remember our usage of ~values~ when returning from our function? This will allow us to return the array and offset. By changing these lines to ~(values 'finished array offset)~, we can do the following:
+    #+begin_src lisp
+      (defun bf-repl (&optional (array-size 30000))
+	(let ((persistent-array (make-array array-size :element-type '(unsigned-byte 8)
+						       :initial-element 0))
+	      (initial-offset 0))
+	  (do ((line (read-line *standard-input* nil) (read-line *standard-input* nil)))
+	      ((null line))
+	    (multiple-value-bind (retval array offset)
+		(interpret-bf line :initial-offset initial-offset :initial-array persistent-array)
+	      (format t "~&")
+	      (if (eql retval 'finished)
+		  (setf persistent-array array
+			initial-offset offset)
+		  (return-from bf-repl))))))
+    #+end_src
+    The only restrictions with this repl are that all loops must be contained within the same line. That is to say, all occurrences of =[= and =]= must have their matching bracket as a part of the same line. 
+
+** IO
+   We could trivially allow redirecting our input and output streams by binding the ~*standard-[in|out]put*~ special variables in our let, like so:
+   #+begin_src lisp
+     (defun interpret-bf (string &key (input-stream *standard-input*) (output-stream *standard-output*))
+       (let ((*standard-input* input-stream)
+	     (*standard-output* output-stream))))
+   #+end_src
+** Out of Bounds Errors
+   When we initially implemented the operators ~>~ and ~<~, we ignored the possibility of the offset becoming negative. Instead, lets write a restart around our function to re-attempt interpretation with a new initial offset. 
+   #+begin_src lisp
+     (restart-bind ((retry-interpretation-using-offset
+		      (lambda (new-offset)
+			(return-from interpret-bf
+			  (interpret-bf string :initial-offset new-offset :initial-array initial-array
+					       :input-stream input-stream :output-stream output-stream)))
+		      :test-function (lambda (c)
+				       (typep c #+sbcl 'sb-int:invalid-array-index-error
+						#-sbcl 'type-error))
+		      :interactive-function (lambda ()
+					      (format *query-io* "Provide a new offset")
+					      (force-output *query-io*)
+					      (list (read)))
+		      :report-function (lambda (s)
+					 (format s "Retry interpretation using a new offset")))))
+   #+end_src
+   This introduces a restart which reads in a new offset value and re-calls ~interpret-bf~ with this as the initial offset. We also pull a little reader macro trick using ~#+~ and ~#-~ syntax to use an SBCL specific condition only when using with SBCL. 
+* All Code
+  All code for the brainfuck interpreter:
+  #+begin_src lisp
+    (defun interpret-bf (string &key initial-offset initial-array
+				  (input-stream *standard-input*)
+				  (output-stream *standard-output*))
+      (let ((array (or initial-array
+		       (make-array 30000 :element-type '(unsigned-byte 8)
+					 :initial-element 0)))
+	    (offset (or initial-offset 0))
+	    (string-position 0)
+	    (max-position (- (length string) 1))
+	    (*standard-input* input-stream)
+	    (*standard-output* output-stream))
+	(restart-bind ((retry-interpretation-using-offset
+			 (lambda (new-offset)
+			   (return-from interpret-bf
+			     (interpret-bf string :initial-offset new-offset
+						  :initial-array initial-array
+						  :input-stream input-stream
+						  :output-stream output-stream)))
+			 :test-function (lambda (c)
+					  (typep c #+sbcl 'sb-int:invalid-array-index-error
+						   #-sbcl 'type-error))
+			 :interactive-function (lambda ()
+						 (format *query-io* "Provide a new offset")
+						 (force-output *query-io*)
+						 (list (read)))
+			 :report-function
+			 (lambda (s) (format s "Retry interpretation using a new offset"))))
+	  (flet ((next-char ()
+		   (let ((x (+ string-position 1)))
+		     (if (> x max-position)
+			 (return-from interpret-bf (values 'finished array offset))
+			 (setf string-position x))))
+		 (prev-char ()
+		   (let ((x (- string-position 1)))
+		     (if (< x 0)
+			 (return-from interpret-bf (values 'source-error array offset))
+			 (setf string-position x))))
+		 (incf-at-offset ()
+		   (let ((x (aref array offset)))
+		     (setf (aref array offset) (or (and (= x 255) 0) (+ x 1)))))
+		 (decf-at-offset ()
+		   (let ((x (aref array offset)))
+		     (setf (aref array offset) (or (and (= x 0) 255) (- x 1))))))
+	    (tagbody
+	       (go bf-dispatch)
+	     bf->
+	       (incf offset)
+	       (go bf-process)
+	     bf-<
+	       (decf offset)
+	       (go bf-process)
+	     bf-+
+	       (incf-at-offset)
+	       (go bf-process)
+	     bf--
+	       (decf-at-offset)
+	       (go bf-process)
+	     bf-dot
+	       (format *standard-output* "~C" (code-char (aref array offset)))
+	       (go bf-process)
+	     bf-comma
+	       (let ((ch (or (read-char *standard-input* nil) (code-char 0))))
+		 (unless (typep (char-code ch) '(integer 0 255))
+		   (error "Invalid Character ~A Entered" ch))
+		 (setf (aref array offset) (char-code ch))) 
+	       (go bf-process)
+	     bf-[
+	       (when (= 0 (aref array offset))
+		 (let ((matches 0))
+		   (do ((ch (aref string string-position)
+			    (aref string string-position)))
+		       ((and (or (and (char= ch #\[)
+				      (incf matches))
+				 t)
+			     (and (char= ch #\])
+				  (decf matches))
+			     (= 0 matches)))
+		     (next-char))))
+	       (go bf-process)
+	     bf-]
+	       (unless (= 0 (aref array offset))
+		 (let ((matches 0))
+		   (do ((ch (aref string string-position)
+			    (aref string string-position)))
+		       ((and (or (and (char= ch #\])
+				      (incf matches))
+				 t)
+			     (and (char= ch #\[)
+				  (decf matches))
+			     (= 0 matches)))
+		     (prev-char))))
+	       (go bf-process)
+	     bf-process
+	       (next-char)
+	     bf-dispatch
+	       (case (aref string string-position)
+		 (#\>  (go bf->))
+		 (#\<  (go bf-<))
+		 (#\+  (go bf-+))
+		 (#\-  (go bf--))
+		 (#\.  (go bf-dot))
+		 (#\,  (go bf-comma))
+		 (#\[  (go bf-[))
+		 (#\]  (go bf-]))
+		 (otherwise (go bf-process))))))))
+
+    (defun bf-repl (&optional (array-size 30000))
+      (let ((persistent-array (make-array array-size :element-type '(unsigned-byte 8)
+						     :initial-element 0))
+	    (initial-offset 0))
+	(do ((line (read-line *standard-input* nil) (read-line *standard-input* nil)))
+	    ((null line))
+	  (multiple-value-bind (retval array offset)
+	      (interpret-bf line :initial-offset initial-offset :initial-array persistent-array)
+	    (format t "~&")
+	    (if (eql retval 'finished)
+		(setf persistent-array array
+		      initial-offset offset)
+		(return-from bf-repl))))))
+  #+end_src 
